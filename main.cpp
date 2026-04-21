@@ -26,6 +26,9 @@
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include <BLE2902.h>
+
+// #define BLE_ROLE_HOST  // comment out to make this device a BLE client instead of server
 
 // -------------------------------------------------------
 // Seesaw gamepad button masks
@@ -137,6 +140,8 @@ static bool        ble_scanning    = false;
 static bool        ble_is_host     = false;  // true = advertising, false = scanning
 static PeerPacket  peer_state      = {};
 static bool        peer_valid      = false;
+static bool peer_finished_first = false;
+static bool local_finished = false;
 
 static BLEServer        *ble_server    = nullptr;
 static BLECharacteristic*ble_char      = nullptr;
@@ -190,14 +195,14 @@ static const uint16_t BADELINE_PAL[10] = {
   rgb(74,35,90),     // 6  dark purple shirt
   rgb(45,18,53),     // 7  shirt shadow
   rgb(26,10,46),     // 8  boots
-  rgb(155,89,182),   // 9  hair (normal)
+  rgb(155,89,182)   // 9  hair (normal)
 };
 
 // Hair colours
 static const uint16_t MADELINE_HAIR_NORMAL = rgb(255,68,68);
 static const uint16_t MADELINE_HAIR_DASH   = rgb(91,141,217);
 static const uint16_t BADELINE_HAIR_NORMAL = rgb(155,89,182);
-static const uint16_t BADELINE_HAIR_DASH   = rgb(108,52,131);
+static const uint16_t BADELINE_HAIR_DASH   = rgb(204, 128, 186);
 
 // Each sprite is 8×8, colour index 0=transparent
 
@@ -455,6 +460,8 @@ static const uint8_t ROOM_DATA[3][MAP_H][MAP_W] = {
 //   tile_flags[TILE_SPIKE_L] = 0;
 //   tile_flags[TILE_SPIKE_R] = 0;
 // }
+
+
 
 static uint8_t mget(int tx, int ty) {
   if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return TILE_EMPTY;
@@ -955,18 +962,22 @@ static void player_update(Object *t) {
   // Send BLE packet in race mode
   if (gameMode == MODE_RACE && ble_connected) {
     PeerPacket pkt;
-    pkt.x      = (int16_t)t->x;
-    pkt.y      = (int16_t)t->y;
-    pkt.room_x = (uint8_t)room.x;
-    pkt.room_y = (uint8_t)room.y;
-    pkt.djump  = (uint8_t)t->djump;
-    pkt.flip_x = (uint8_t)(t->flip_x ? 1 : 0);
-    pkt.char_id= (uint8_t)selectedChar;
-    pkt.finished= (uint8_t)(endResult==END_WIN ? 1 : 0);
-    if (ble_is_host && ble_char)
+    pkt.x       = (int16_t)t->x;
+    pkt.y       = (int16_t)t->y;
+    pkt.room_x  = (uint8_t)room.x;
+    pkt.room_y  = (uint8_t)room.y;
+    pkt.djump   = (uint8_t)t->djump;
+    pkt.flip_x  = (uint8_t)(t->flip_x ? 1 : 0);
+    pkt.char_id = (uint8_t)selectedChar;
+    pkt.finished = (uint8_t)(local_finished ? 1 : 0);
+    if (ble_is_host && ble_char) {
+      // Host notifies client
       ble_char->setValue((uint8_t*)&pkt, sizeof(pkt));
-    else if (!ble_is_host && ble_remote_char)
+      ble_char->notify();
+    } else if (!ble_is_host && ble_remote_char) {
+      // Client writes to host
       ble_remote_char->writeValue((uint8_t*)&pkt, sizeof(pkt), false);
+    }
   }
 }
 
@@ -1280,10 +1291,28 @@ static void kill_player(Object *obj) {
 static void restart_room() { will_restart=true; delay_restart=15; }
 
 static void next_room() {
-  int next=level_index()+1;
-  if (next>=3) {
-    // All rooms complete — go to end screen
-    endResult = (gameMode==MODE_RACE) ? END_WIN : END_SOLO;
+  int next = level_index() + 1;
+  if (next >= 3) {
+    local_finished = true;
+    if (gameMode == MODE_RACE && ble_connected) {
+      PeerPacket pkt = {};
+      pkt.finished = 1;
+      pkt.char_id  = (uint8_t)selectedChar;
+      for (int i = 0; i < 5; i++) {
+        if (ble_is_host && ble_char) {
+          ble_char->setValue((uint8_t*)&pkt, sizeof(pkt));
+          ble_char->notify();
+        } else if (!ble_is_host && ble_remote_char) {
+          ble_remote_char->writeValue((uint8_t*)&pkt, sizeof(pkt), false);
+        }
+        delay(20);
+      }
+    }
+    if (gameMode == MODE_RACE) {
+      endResult = peer_finished_first ? END_LOSE : END_WIN;
+    } else {
+      endResult = END_SOLO;
+    }
     end_frames = 0;
     gameMode = MODE_END;
     return;
@@ -1339,6 +1368,8 @@ static void title_screen() {
   load_room(7,3);
 }
 static void begin_game() {
+  peer_finished_first = false;
+  local_finished = false;
   frames=0; seconds=0; minutes=0; music_timer=0; start_game=false;
   pico_music(0,0,7);
   load_room(0,0);
@@ -1354,12 +1385,15 @@ class BLEConnectionCB : public BLEServerCallbacks {
 
 class BLEDataCB : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *c) override {
-    std::string val=c->getValue();
-    if (val.size()==sizeof(PeerPacket)) {
+    std::string val = c->getValue();
+    if (val.size() == sizeof(PeerPacket)) {
       memcpy(&peer_state, val.data(), sizeof(PeerPacket));
-      peer_valid=true;
-      if (peer_state.finished && gameMode==MODE_RACE) {
-        endResult=END_LOSE; end_frames=0; gameMode=MODE_END;
+      peer_valid = true;
+      if (peer_state.finished && gameMode == MODE_RACE) {
+        peer_finished_first = true;
+        endResult = END_LOSE;
+        end_frames = 0;
+        gameMode = MODE_END;
       }
     }
   }
@@ -1367,50 +1401,73 @@ class BLEDataCB : public BLECharacteristicCallbacks {
 
 // Client notification callback
 static void ble_notify_cb(BLERemoteCharacteristic*, uint8_t *data, size_t len, bool) {
-  if (len==sizeof(PeerPacket)) {
-    memcpy(&peer_state,data,sizeof(PeerPacket));
-    peer_valid=true;
-    if (peer_state.finished && gameMode==MODE_RACE) {
-      endResult=END_LOSE; end_frames=0; gameMode=MODE_END;
+  if (len == sizeof(PeerPacket)) {
+    memcpy(&peer_state, data, sizeof(PeerPacket));
+    peer_valid = true;
+    if (peer_state.finished && gameMode == MODE_RACE) {
+      peer_finished_first = true;
+      endResult = END_LOSE;
+      end_frames = 0;
+      gameMode = MODE_END;
     }
   }
 }
 
 static void ble_start_host() {
   BLEDevice::init(BLE_DEVICE_NAME);
-  ble_server=BLEDevice::createServer();
+  ble_server = BLEDevice::createServer();
   ble_server->setCallbacks(new BLEConnectionCB());
-  BLEService *svc=ble_server->createService(BLE_SERVICE_UUID);
-  ble_char=svc->createCharacteristic(BLE_CHAR_UUID,
-    BLECharacteristic::PROPERTY_READ|BLECharacteristic::PROPERTY_WRITE|BLECharacteristic::PROPERTY_NOTIFY);
+  BLEService *svc = ble_server->createService(BLE_SERVICE_UUID);
+  ble_char = svc->createCharacteristic(BLE_CHAR_UUID,
+    BLECharacteristic::PROPERTY_READ |
+    BLECharacteristic::PROPERTY_WRITE |
+    BLECharacteristic::PROPERTY_NOTIFY);
   ble_char->setCallbacks(new BLEDataCB());
+
+  // Add descriptor so client can subscribe to notifications from host
+  BLE2902 *desc = new BLE2902();
+  desc->setNotifications(true);
+  ble_char->addDescriptor(desc);
+
   svc->start();
-  BLEAdvertising *adv=BLEDevice::getAdvertising();
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(BLE_SERVICE_UUID);
   adv->start();
-  ble_is_host=true; ble_scanning=true;
+  ble_is_host = true;
+  ble_scanning = true;
 }
 
-static bool ble_found_device=false;
+static bool ble_found_device = false;
 static BLEAdvertisedDevice ble_target_device;
 
 class BLEScanCB : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice dev) override {
     if (dev.haveServiceUUID() && dev.isAdvertisingService(BLEUUID(BLE_SERVICE_UUID))) {
       BLEDevice::getScan()->stop();
-      ble_target_device=dev; ble_found_device=true;
+      ble_target_device = dev;
+      ble_found_device = true;
     }
   }
 };
 
 static void ble_start_client() {
   BLEDevice::init(BLE_DEVICE_NAME);
-  BLEScan *scan=BLEDevice::getScan();
+  BLEScan *scan = BLEDevice::getScan();
   scan->setAdvertisedDeviceCallbacks(new BLEScanCB());
   scan->setActiveScan(true);
-  scan->start(10,false);  // 10s scan
-  ble_is_host=false; ble_scanning=true;
+  scan->start(30, false);
+  ble_is_host = false;
+  ble_scanning = true;
 }
+
+static void ble_init_role() {
+#ifdef BLE_ROLE_HOST
+  ble_start_host();
+#else
+  ble_start_client();
+#endif
+}
+
 
 static void ble_try_connect() {
   if (!ble_found_device) return;
@@ -1847,58 +1904,60 @@ static void draw_end_screen() {
 // Main screen input handling
 // -------------------------------------------------------
 static void update_main_screen(uint32_t raw_cur, uint32_t raw_prv) {
-  // Y button → select Madeline
-  if (raw_just(BUTTON_Y, raw_cur, raw_prv)) selectedChar=CHAR_MADELINE;
-  // A button → select Badeline
-  if (raw_just(BUTTON_A, raw_cur, raw_prv)) selectedChar=CHAR_BADELINE;
+  if (raw_just(BUTTON_Y, raw_cur, raw_prv)) selectedChar = CHAR_MADELINE;
+  if (raw_just(BUTTON_A, raw_cur, raw_prv)) selectedChar = CHAR_BADELINE;
 
-  // DEBUG: X → WIN screen, B → LOSE screen (remove before final build)
-  if (raw_just(BUTTON_X, raw_cur, raw_prv)) { endResult=END_WIN;  end_frames=0; gameMode=MODE_END; }
-  if (raw_just(BUTTON_B, raw_cur, raw_prv)) { endResult=END_LOSE; end_frames=0; gameMode=MODE_END; }
+  // DEBUG: remove before final build
+  if (raw_just(BUTTON_X, raw_cur, raw_prv)) { endResult = END_WIN;  end_frames = 0; gameMode = MODE_END; }
+  if (raw_just(BUTTON_B, raw_cur, raw_prv)) { endResult = END_LOSE; end_frames = 0; gameMode = MODE_END; }
 
-  // START → attempt BLE race mode (start as host first, client can join)
+  // START -> race if connected, otherwise ignored
   if (raw_just(BUTTON_START, raw_cur, raw_prv)) {
     if (ble_connected) {
-      gameMode=MODE_RACE; begin_game();
-    } else {
-      // Toggle host/client each press so one device advertises and one scans
-      if (!ble_scanning) { ble_start_host(); }
-      else { /* already scanning/advertising, just wait */ }
+      gameMode = MODE_RACE;
+      begin_game();
     }
   }
 
-  // SELECT → solo play immediately
+  // SELECT -> solo
   if (raw_just(BUTTON_SELECT, raw_cur, raw_prv)) {
-    gameMode=MODE_SOLO; begin_game();
+    gameMode = MODE_SOLO;
+    begin_game();
   }
 
-  // If BLE client found and not yet connected, try to connect
-  if (!ble_is_host && ble_found_device && !ble_connected) ble_try_connect();
+  // Client only: attempt connection once when host is found
+#ifndef BLE_ROLE_HOST
+  static bool connect_attempted = false;
+  if (ble_found_device && !ble_connected && !connect_attempted) {
+    connect_attempted = true;
+    ble_try_connect();
+  }
+#endif
 }
 
 // -------------------------------------------------------
 // Arduino entry points
 // -------------------------------------------------------
 void setup() {
-  auto cfg=M5.config();
+  auto cfg = M5.config();
   M5.begin(cfg);
 
-  canvas.createSprite(320,240);
+  canvas.createSprite(320, 240);
   canvas.setTextSize(1);
 
   if (!gamepad.begin(0x50)) {
-    M5.Display.drawString("Gamepad not found!",10,10);
+    M5.Display.drawString("Gamepad not found!", 10, 10);
     while (1) delay(100);
   }
-  gamepad.pinModeBulk(BUTTON_X|BUTTON_Y|BUTTON_A|BUTTON_B|BUTTON_SELECT|BUTTON_START, INPUT_PULLUP);
+  gamepad.pinModeBulk(BUTTON_X | BUTTON_Y | BUTTON_A | BUTTON_B | BUTTON_SELECT | BUTTON_START, INPUT_PULLUP);
 
   srand(millis());
-    init_tile_flags_custom();
+  init_tile_flags_custom();
   init_types();
   init_particles();
 
-  // Start on main screen instead of title room
-  gameMode=MODE_MAIN_SCREEN;
+  gameMode = MODE_MAIN_SCREEN;
+  ble_init_role();  // auto-starts based on role define
 }
 
 void loop() {
