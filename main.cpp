@@ -1542,97 +1542,240 @@ static void draw_char_preview_pico(int px, int py, CharSelect ch, bool selected)
   }
 }
 
+// -------------------------------------------------------
+// Main screen drawing — all in PICO-8 coords (0..127)
+// Layout (128 rows total):
+//   0..69   sky + mountain scene
+//   70..71  ground line
+//   72..79  title text
+//   80..95  character preview cards (16px tall at 2× = 16 PICO rows)
+//   96..103 character names
+//  104..127 → BLE bar drawn in raw screen pixels at y=208 (PICO row 108)
+//            so it sits cleanly in the black area below the canvas
+// -------------------------------------------------------
+
+// Draw a horizontal row of overlapping circles from sx to ex at screen y cy,
+// each with radius r. Stepping by r gives solid fill with rounded top/bottom edges,
+// faking a wide flat ellipse — the exact same loop M5GFX fillCircle uses internally.
+static void menu_circle_row(int sx, int ex, int cy, int r, uint16_t col) {
+  for (int cx = sx; cx <= ex; cx += r) {
+    int actualCx = (cx > ex) ? ex : cx;
+    for (int dy = -r; dy <= r; dy++) {
+      int dx = (int)sqrtf((float)(r*r - dy*dy));
+      tft.fillRect(actualCx - dx, cy + dy, dx*2+1, 1, col);
+    }
+  }
+  // Always draw one at ex to close the right edge
+  for (int dy = -r; dy <= r; dy++) {
+    int dx = (int)sqrtf((float)(r*r - dy*dy));
+    tft.fillRect(ex - dx, cy + dy, dx*2+1, 1, col);
+  }
+}
+
 static void draw_mountain() {
-  // Stars — deterministic, no flicker
-  for (int i=0;i<18;i++) {
-    int sx=(i*41+11)%122; int sy=(i*17+5)%60;
-    rectfill(sx,sy,sx,sy, (i%4==0)?7:6);
+  // All coords are raw screen pixels (320×240).
+  // Mountain peak: x=160 y=18. Base: y=152, x=20..300.
+  // Half-width at screen y:  hw(y) = (y-18) * 140 / 134
+
+  // --- Sky bands (full width) ---
+  static const struct { int y,h; uint16_t c; } sky[]={
+    {0,  25, rgb(74,56,112)},
+    {25, 25, rgb(122,80,144)},
+    {50, 25, rgb(168,112,144)},
+    {75, 25, rgb(200,144,144)},
+    {100,24, rgb(216,168,152)},
+    {124,30, rgb(224,184,168)},
+  };
+  for (auto &b : sky) tft.fillRect(0, b.y, 320, b.h, b.c);
+
+  // --- Stars (deterministic) ---
+  static const struct { uint16_t x; uint8_t y,s; } stars[]={
+    {20,8,2},{60,15,1},{110,5,1},{160,12,2},{220,8,1},{270,18,1},
+    {300,6,2},{45,22,1},{140,20,1},{250,10,1},{80,30,1},{310,25,1}
+  };
+  for (auto &s : stars) tft.fillRect(s.x, s.y, s.s, s.s, rgb(255,255,255));
+
+  // --- Distant mountains (3 soft peaks) ---
+  static const struct { int cx,cy,hw; } far[]={{55,105,50},{175,98,60},{295,108,45}};
+  for (auto &p : far) {
+    for (int x=p.cx-p.hw; x<=p.cx+p.hw; x++) {
+      int h = p.cy + abs(x-p.cx)*(148-p.cy)/p.hw;
+      if (h>148) h=148;
+      tft.fillRect(x, h, 1, 148-h, rgb(122,88,120));
+    }
+    // Snow tip on far peaks
+    int sw=7;
+    for (int x=p.cx-sw; x<=p.cx+sw; x++) {
+      int h = p.cy + abs(x-p.cx)*(p.cy+sw*1-p.cy)/sw;
+      tft.fillRect(x, h, 1, 3, rgb(212,200,224));
+    }
   }
 
-  // Animated snow — mirrors room particle system exactly
+  // --- Ground fog ---
+  tft.fillRect(0, 142, 320, 6,  rgb(144,112,160));
+  tft.fillRect(0, 148, 320, 4,  rgb(106, 72,128));
+
+  // --- Main mountain — two-face shading ---
+  // Left face (darker)
+  for (int x=20; x<=160; x++) {
+    int h = 18 + (160-x)*134/140;
+    if (h<18) h=18; if (h>152) h=152;
+    tft.fillRect(x, h, 1, 152-h, rgb(42,24,72));
+  }
+  // Right face (lighter)
+  for (int x=160; x<=300; x++) {
+    int h = 18 + (x-160)*134/140;
+    if (h<18) h=18; if (h>152) h=152;
+    tft.fillRect(x, h, 1, 152-h, rgb(61,36,104));
+  }
+  // Subtle ridge lines
+  for (int x=160; x<=215; x++) {
+    int mh = 18+(x-160)*134/140;
+    tft.fillRect(x, mh, 1, (152-mh)/5, rgb(120,80,160));
+  }
+  for (int x=105; x<=160; x++) {
+    int mh = 18+(160-x)*134/140;
+    tft.fillRect(x, mh, 1, (152-mh)/5, rgb(120,80,160));
+  }
+
+  // --- Snow cap — rows of circles faking wide flat ellipses ---
+  // Each layer's x-span comes from mountain half-width at (cy+r):
+  //   hw = (cy+r-18)*140/134
+  // Layers from widest/lowest → narrowest/highest:
+  static const struct { int cy,r; uint16_t c; } layers[]={
+    {72, 8, 0},  // computed below
+    {62, 8, 0},
+    {52, 7, 0},
+    {42, 6, 0},
+    {33, 5, 0},
+    {25, 4, 0},
+    {19, 3, 0},
+  };
+  static const uint16_t snow_cols[]={
+    rgb(158,148,192), rgb(176,164,204), rgb(196,186,220),
+    rgb(216,208,236), rgb(234,228,244), rgb(246,242,252), rgb(255,255,255)
+  };
+  for (int li=0; li<7; li++) {
+    int cy=layers[li].cy, r=layers[li].r;
+    int hw = (cy+r-18)*140/134;
+    if (hw<r) hw=r;
+    int sx=160-hw, ex=160+hw;
+    menu_circle_row(sx, ex, cy, r, snow_cols[li]);
+  }
+  // Shoulder drip blobs
+  menu_circle_row(118,145, 80, 5, rgb(154,144,184));
+  menu_circle_row(175,202, 80, 5, rgb(154,144,184));
+  menu_circle_row(105,128, 88, 4, rgb(142,134,174));
+  menu_circle_row(192,215, 88, 4, rgb(142,134,174));
+
+  // --- Wings — rows of pixels, tip points up and out ---
+  // Madeline left wing (attached at ~screen x=130, y=56)
+  {
+    uint16_t wc = (selectedChar==CHAR_MADELINE) ? rgb(216,88,88)  : rgb(90,56,72);
+    uint16_t wh = (selectedChar==CHAR_MADELINE) ? rgb(240,152,152): rgb(122,80,96);
+    uint16_t tip= (selectedChar==CHAR_MADELINE) ? rgb(255,184,184): rgb(0,0,0);
+    for (int i=0;i<13;i++) {
+      int w=(12-i)*3;
+      tft.fillRect(130-w, 56+i, w, 1, i<6?wh:wc);
+    }
+    if (selectedChar==CHAR_MADELINE) {
+      tft.fillRect(91,56,5,2,tip);
+      tft.fillRect(75,62,5,2,tip);
+      tft.fillRect(70,68,5,2,tip);
+    }
+  }
+  // Badeline right wing (attached at ~screen x=190, y=56)
+  {
+    uint16_t wc = (selectedChar==CHAR_BADELINE) ? rgb(128,80,176) : rgb(74,56,96);
+    uint16_t wh = (selectedChar==CHAR_BADELINE) ? rgb(192,136,232): rgb(106,80,128);
+    uint16_t tip= (selectedChar==CHAR_BADELINE) ? rgb(216,168,255): rgb(0,0,0);
+    for (int i=0;i<13;i++) {
+      int w=(12-i)*3;
+      tft.fillRect(190, 56+i, w, 1, i<6?wh:wc);
+    }
+    if (selectedChar==CHAR_BADELINE) {
+      tft.fillRect(229,56,5,2,tip);
+      tft.fillRect(245,62,5,2,tip);
+      tft.fillRect(250,68,5,2,tip);
+    }
+  }
+
+  // --- Animated snow particles ---
   if (!snow_inited) init_snow();
   for (int i=0;i<MAX_SNOW;i++) {
     snow[i].x   += snow[i].spd;
-    snow[i].y   += pico_sin(snow[i].off) * 0.4f;
+    snow[i].y   += pico_sin(snow[i].off) * 0.8f;
     snow[i].off += pico_min(0.05f, snow[i].spd / 32.0f);
-    int s = (int)snow[i].s;
-    // keep flakes in the sky zone (above y=68)
-    if (snow[i].y < 0)  snow[i].y = pico_rnd(68);
-    if (snow[i].y > 68) snow[i].y = pico_rnd(68);
-    if (snow[i].x > 132) { snow[i].x = -4; snow[i].y = pico_rnd(68); }
-    rectfill((int)snow[i].x, (int)snow[i].y,
-             (int)snow[i].x + s, (int)snow[i].y + s, 7);
+    if (snow[i].y < 0)   snow[i].y = pico_rnd(148);
+    if (snow[i].y > 148) snow[i].y = pico_rnd(148);
+    if (snow[i].x > 325) { snow[i].x = -4; snow[i].y = pico_rnd(148); }
+    int s = (int)(snow[i].s * SCALE);
+    tft.fillRect((int)snow[i].x, (int)snow[i].y, s, s, rgb(255,255,255));
   }
 
-  // Back hills (colour 2 = dark purple) — capped at y=68
-  for (int x=0;x<=56;x++) {
-    int h = 52 + abs(x-28)*16/28;
-    if (h>68) h=68;
-    rectfill(x, h, x, 68, 2);
-  }
-  for (int x=72;x<=127;x++) {
-    int h = 52 + abs(x-100)*16/28;
-    if (h>68) h=68;
-    rectfill(x, h, x, 68, 2);
-  }
-
-  // Main mountain (colour 1 = dark blue), peak x=64 y=4, base y=70
-  for (int x=10;x<=118;x++) {
-    int h = 4 + abs(x-64)*66/54;
-    if (h>70) h=70;
-    rectfill(x, h, x, 70, 1);
-  }
-
-  // Wings — triangles pointing UP and OUT from the mountain slope
-  // Madeline (left): base on slope ~y=26..38, tip points up-left
-  {
-    int col = (selectedChar==CHAR_MADELINE) ? 8 : 5;
-    for (int i=0;i<12;i++)
-      rectfill(52-i*2, 38-i, 52, 38-i, col);
-  }
-  // Badeline (right): mirror — tip points up-right
-  {
-    int col = (selectedChar==CHAR_BADELINE) ? 13 : 5;
-    for (int i=0;i<12;i++)
-      rectfill(76, 38-i, 76+i*2, 38-i, col);
-  }
-
-  // Ground line
-  rectfill(0,70,127,71,1);
+  // --- Ground strip ---
+  tft.fillRect(0, 152, 320, 4, rgb(26,10,48));
 }
 
 static void draw_main_screen() {
+  // Clear full canvas to black
   canvas.fillSprite(PICO_PAL[0]);
 
-  // --- Sky + mountain (rows 0..71) ---
-  rectfill(0,0,127,71,0);
+  // Mountain scene fills top 156 screen rows entirely
   draw_mountain();
 
-  // --- Title (rows 73..80) ---
+  // --- Title in screen pixels ---
   tft.setTextSize(2);
-  pico_print("CELESTE",   43, 73, 7);
+  tft.setTextColor(rgb(255,251,232));
+  tft.drawString("CELESTE", 118, 158);
   tft.setTextSize(1);
-  // pico_print("M5CORE2 ED",36, 80, 5);
 
-  // --- Character previews (rows 84..99) ---
-  // Left card x=18, right card x=92. Sprite is 8px wide at 2× = 16px.
-  // Card spans x=17..34 (centre=25) and x=91..108 (centre=99).
-  draw_char_preview_pico(18, 84, CHAR_MADELINE, selectedChar==CHAR_MADELINE);
-  draw_char_preview_pico(92, 84, CHAR_BADELINE, selectedChar==CHAR_BADELINE);
+  // --- Character cards in screen pixels ---
+  // Left card: screen x=52, right card: x=228, top y=174, size 40×36
+  const int CARD_Y = 174;
+  const int CARD_W = 40, CARD_H = 36;
+  const int SPR_SC = 4;  // sprite scale inside card
 
-  // --- Names centred under each card (row 101) ---
-  // pico_print uses M5GFX default font: 6px per char at textSize(1).
-  // At SCALE=2 that's 12 screen px per char, but pico_print works in PICO coords:
-  // each char ≈ 4 PICO px wide. "MADELINE" = 8*4 = 32px. Centre=25 → start=25-16=9
-  // "BADELINE" = 8*4 = 32px. Centre=99 → start=99-16=83
-  pico_print("MADELINE",  15, 101, selectedChar==CHAR_MADELINE ? 7 : 5);
-  pico_print("BADELINE", 88, 101, selectedChar==CHAR_BADELINE ? 7 : 5);
+  // Madeline card
+  bool madSel = (selectedChar==CHAR_MADELINE);
+  uint16_t madBorder = madSel ? rgb(255,112,112) : rgb(90,56,112);
+  uint16_t madBg     = madSel ? rgb(60,16,16)    : rgb(30,10,50);
+  tft.fillRect(50, CARD_Y, CARD_W, CARD_H, madBg);
+  tft.drawRect(50, CARD_Y, CARD_W, CARD_H, madBorder);
+  // Sprite at 4× inside card (offset 2px padding)
+  for (int row=0;row<8;row++) {
+    for (int col=0;col<8;col++) {
+      int c=PLAYER_SPR[row][col]; if (!c) continue;
+      uint16_t color=(c==9)?MADELINE_HAIR_NORMAL:MADELINE_PAL[c];
+      tft.fillRect(54+col*SPR_SC, CARD_Y+2+row*SPR_SC, SPR_SC, SPR_SC, color);
+    }
+  }
+  tft.setTextColor(madSel ? rgb(255,170,170) : rgb(144,128,160));
+  tft.drawString("MADELINE", 55, CARD_Y+CARD_H+2);
+  tft.setTextColor(rgb(128,144,168));
+  tft.drawString("Y BUTTON", 57, CARD_Y+CARD_H+12);
 
-  // --- BLE bar in raw screen pixels ---
-  // PICO row 104 → screen y = OFFSET_Y + 104*SCALE = -8+208 = 200.
-  // Names end at PICO row ~109 → screen y ~210. Use bar_y=212 for a 2px gap.
+  // Badeline card
+  bool badSel = (selectedChar==CHAR_BADELINE);
+  uint16_t badBorder = badSel ? rgb(192,128,240) : rgb(90,56,112);
+  uint16_t badBg     = badSel ? rgb(36,10,56)    : rgb(30,10,50);
+  tft.fillRect(226, CARD_Y, CARD_W, CARD_H, badBg);
+  tft.drawRect(226, CARD_Y, CARD_W, CARD_H, badBorder);
+  for (int row=0;row<8;row++) {
+    for (int col=0;col<8;col++) {
+      int c=PLAYER_SPR[row][col]; if (!c) continue;
+      uint16_t color=(c==9)?BADELINE_HAIR_NORMAL:BADELINE_PAL[c];
+      tft.fillRect(230+col*SPR_SC, CARD_Y+2+row*SPR_SC, SPR_SC, SPR_SC, color);
+    }
+  }
+  tft.setTextColor(badSel ? rgb(208,160,255) : rgb(144,128,160));
+  tft.drawString("BADELINE", 231, CARD_Y+CARD_H+2);
+  tft.setTextColor(rgb(128,144,168));
+  tft.drawString("A BUTTON", 233, CARD_Y+CARD_H+12);
+
+  // --- BLE bar ---
   int bar_y = 212;
-  tft.fillRect(0, bar_y, 320, 28, rgb(8,8,24));
+  tft.fillRect(0, bar_y, 320, 28, rgb(6,3,18));
   tft.setTextSize(1);
   tft.setTextColor(PICO_PAL[5]);
   tft.drawString("BLUETOOTH:", 8, bar_y+3);
@@ -1663,7 +1806,7 @@ static void draw_main_screen() {
 // Stats bar drawn in raw screen pixels at y=210.
 // -------------------------------------------------------
 
-// Sky color bands — warm pink/purple matching the reference art
+// Sky colour bands — warm pink/purple matching the reference art
 static void end_draw_sky(bool dim) {
   static const struct { int y,h; uint16_t c; } bands[]={
     {0,  22, rgb(107,90,138)},
@@ -1681,7 +1824,7 @@ static void end_draw_sky(bool dim) {
       uint8_t b2=(c     &0x1F)>>1;
       c=(r<<11)|(g<<5)|b2;
     }
-    tft.fillRect(0, OFFSET_Y+b.y*SCALE, 320, b.h*SCALE, b.c);
+    tft.fillRect(0, OFFSET_Y+b.y*SCALE, 320, b.h*SCALE, c);
   }
 }
 
@@ -1718,7 +1861,7 @@ static void end_draw_clouds() {
     {200,97,38,15,rgb(237,232,224)}, {245,100,33,14,rgb(232,226,216)},
     {295,98,30,15,rgb(237,232,224)},
     // Purple-tinted clouds
-    { 80,96,28,12,rgb(196,172,208)}, {140,97,24,10,rgb(200,176,212)}, {1,97,24,10,rgb(200,176,212)},
+    { 80,96,28,12,rgb(196,172,208)}, {140,97,24,10,rgb(200,176,212)}, {1,97,24,10,rgb(200,176,212)}, {1,97,24,6,rgb(200,176,212)},
     // Upper wispy
     { 40,82,16, 7,rgb(221,214,204)}, {120,80,14, 6,rgb(216,208,200)},
     {220,81,18, 7,rgb(221,214,204)},
@@ -1860,14 +2003,14 @@ static void draw_end_screen() {
   if (endResult==END_WIN) {
     tft.setTextSize(2);
     pico_print("WIN!", 50, 20, 7);
-    tft.setTextSize(1);  // restore default
+    tft.setTextSize(1);
   } else if (endResult==END_LOSE) {
     tft.setTextSize(2);
     pico_print("LOSE", 48, 20, 13);
     tft.setTextSize(1);
   } else {
     tft.setTextSize(2);
-    pico_print("SUMMIT!", 40, 2, 7);
+    pico_print("SUMMIT!", 40, 20, 7);
     tft.setTextSize(1);
   }
 
@@ -1883,7 +2026,7 @@ static void draw_end_screen() {
     char dbuf[16]; sprintf(dbuf,"DEATHS  %d",deaths);
     tft.drawString(dbuf, 202, 82);
     tft.setTextColor(rgb(180,200,220));
-    tft.drawString("START->MENU", 202, 96);
+    // tft.drawString("START->MENU", 202, 96);
   }
 
   // Stats bar
@@ -1893,8 +2036,7 @@ static void draw_end_screen() {
     end_draw_stats_bar(line1, "START -> RETURN TO MENU", rgb(255,251,232));
   } else if (endResult==END_LOSE) {
     char line1[40]; sprintf(line1,"TIME %02d:%02d:%02d   DEATHS %d",h2,m2,seconds,deaths);
-    end_draw_stats_bar("OPPONENT FINISHED FIRST",
-                       "START -> RETURN TO MENU", rgb(200,176,216));
+    end_draw_stats_bar(line1, "OPPONENT FINISHED FIRST  |  START -> MENU", rgb(200,176,216));
   } else {
     end_draw_stats_bar("", "START -> RETURN TO MENU", rgb(255,251,232));
   }
